@@ -5,6 +5,10 @@ import sys
 from pathlib import Path
 from directory_manager import CLONED_PROJECTS_DIR, extract_relative_path
 import xml.etree.ElementTree as ET
+import logging
+
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 # Define a variable that stores the name of the "output" folder
 OUTPUT_DIR = "output"
@@ -36,8 +40,9 @@ class SrcMLAnalyzer:
                     try:
                         self.process_project(project_dir, writer)
                     except Exception as e:
-                        print(f"Error processing {project_dir}: {e}")
-                        sys.exit(1)
+                        LOGGER.exception('Error processing %s: %s', project_dir, e)
+                        # Continue processing other projects instead of exiting
+                        continue
         except IOError as e:
             print(f"Error opening/creating CSV file: {e}")
             sys.exit(1)
@@ -60,8 +65,8 @@ class SrcMLAnalyzer:
         """Convert .c file to XML using srcML."""
         result = subprocess.run(['srcml', c_file_path, '-o', xml_output_path], capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"Error generating XML for {c_file_path}: {result.stderr}")
-            sys.exit(1)
+            LOGGER.warning('srcml failed for %s: %s', c_file_path, result.stderr)
+            raise RuntimeError(f'srcml failed for {c_file_path}: {result.stderr}')
 
     def extract_call_graph(self, xml_output_path, project_name, c_file, writer):
         """Extract caller-callee pairs from the srcML XML."""
@@ -73,10 +78,22 @@ class SrcMLAnalyzer:
 
         # Traverse the XML to find functions and calls
         for function in root.findall('.//src:function', namespaces):
-            caller = function.find('src:name', namespaces).text
-            for call in function.findall('.//src:call/src:name', namespaces):
-                callee = call.text
-                writer.writerow([project_name, extract_relative_path(str(c_file)), caller, callee])
+            name_elem = function.find('src:name', namespaces)
+            if name_elem is None or name_elem.text is None:
+                # unnamed/anonymous function — skip or mark as <anonymous>
+                caller = '<anonymous>'
+            else:
+                caller = name_elem.text.strip()
+
+            for call_name in function.findall('.//src:call/src:name', namespaces):
+                if call_name is None or call_name.text is None:
+                    callee = '<unknown>'
+                else:
+                    callee = call_name.text.strip()
+                try:
+                    writer.writerow([project_name, extract_relative_path(str(c_file)), caller, callee])
+                except Exception:
+                    LOGGER.exception('Failed writing CSV row for %s %s -> %s', project_name, caller, callee)
 
     def _save_csv(self, data, project_name, c_file, writer):
         pass  # Not needed in srcML version
