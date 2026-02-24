@@ -1,5 +1,5 @@
 # from github_repo_search import save_links_to_file
-from clone_repositories import download_repositories
+from clone_repositories import download_repositories_entry
 from directory_manager import get_project_dirs_and_output
 from program_snc import SrcMLAnalyzer
 from csv_display import display_csv  
@@ -10,7 +10,7 @@ def main():
     # save_links_to_file()     # Save GitHub repository links to a file
     
     print("Starting the process of downloading repositories...")
-    download_repositories()     # Download repositories from GitHub
+    download_repositories_entry()     # Download repositories from GitHub
 
     # print("Getting project directories and output CSV file path...")
     # project_dirs, output_csv = get_project_dirs_and_output()     # Get project directories and CSV output path

@@ -1,140 +1,203 @@
 import requests
 import os
+import sys
 import time
-from datetime import datetime, timezone  # Ensure timezone is imported
+import logging
+import math
+from datetime import datetime, timezone
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Ensure local modules importable
+sys.path.insert(0, os.path.dirname(__file__))
+
 from directory_manager import CLONED_PROJECTS_DIR, REPOSITORIES
 from get_github_token import get_github_token
-from email_notifier import send_email  # Import the email notifier
-import math
 
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+# Configuration
 BASE_API_URL = "https://api.github.com/repos"
+RAW_BASE = "https://raw.githubusercontent.com"
+DEFAULT_TIMEOUT = 10  # seconds for HTTP requests
+MAX_WORKERS = int(os.getenv('DOWNLOAD_WORKERS', '4'))
+REPO_CONCURRENCY = int(os.getenv('REPO_CONCURRENCY', '3'))
+RETRY_TOTAL = 3
+RETRY_BACKOFF = 1
 
-def check_rate_limit():
-    """Check the remaining GitHub API rate limit and pause if necessary."""
-    github_token = get_github_token()
-    headers = {"Authorization": f"token {github_token}"}
-    api_url = "https://api.github.com/rate_limit"
-    
+
+def create_session(token: str) -> requests.Session:
+    session = requests.Session()
+    headers = {
+        'Authorization': f'token {token}',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'repo-miner/1.0'
+    }
+    session.headers.update(headers)
+
+    retries = Retry(total=RETRY_TOTAL, backoff_factor=RETRY_BACKOFF,
+                    status_forcelist=(500, 502, 503, 504), allowed_methods=frozenset(['GET', 'POST']))
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
+
+
+def parse_rate_limit_headers(headers):
     try:
-        response = requests.get(api_url, headers=headers)
-        if response.status_code == 200:
-            rate_limit = response.json()
-            remaining = rate_limit['rate']['remaining']
-            reset_time = rate_limit['rate']['reset']
-            
-            if remaining == 0:
-                current_time = int(time.time())
-                wait_time = max(0, reset_time - current_time)  # Ensure non-negative wait time
-                wait_minutes = math.ceil(wait_time / 60)  # Convert to minutes for readability
-                reset_timestamp = datetime.fromtimestamp(reset_time, tz=timezone.utc)
-                
-                print(
-                    f"[Rate Limit] GitHub API limit reached. "
-                    f"Reset expected at {reset_timestamp} "
-                    f"(in {wait_minutes} minute(s), {wait_time} second(s))."
-                )
+        remaining = int(headers.get('X-RateLimit-Remaining', '0'))
+        reset = int(headers.get('X-RateLimit-Reset', '0'))
+        return remaining, reset
+    except Exception:
+        return None, None
 
-                time.sleep(wait_time)  # Wait for the calculated time
-        else:
-            print(f"[Error] Failed to check rate limit. Status code: {response.status_code}. Retrying after 60 seconds.")
-            time.sleep(60)  # Safe fallback wait
-    except requests.RequestException as e:
-        print(f"[Critical] Network error while checking rate limit: {e}. Retrying after 120 seconds.")
-        time.sleep(120)  # Safe fallback wait
 
-def extract_repo_info(repo_link):
-    """Extract repository owner and name from the repository URL."""
+def wait_for_rate_limit(reset_ts):
+    now = int(time.time())
+    wait = max(0, reset_ts - now)
+    if wait > 0:
+        LOGGER.warning('Rate limit reached, sleeping %d seconds until reset', wait)
+        time.sleep(wait + 1)
+
+
+def extract_repo_info(repo_link: str):
     parsed_url = urlparse(repo_link)
     path = parsed_url.path.strip('/')
     parts = path.split('/')
-    if len(parts) == 2:
+    if len(parts) >= 2:
         repo_owner, repo_name = parts[0], parts[1]
-        print(f"Extracted repository info - Owner: {repo_owner}, Repository: {repo_name}")
+        LOGGER.debug('Extracted repository info - Owner: %s, Repository: %s', repo_owner, repo_name)
         return repo_owner, repo_name
     else:
-        raise ValueError("The URL is not in the expected format.")
+        raise ValueError('The URL is not in the expected format.')
 
-def get_files_from_github(repo_owner, repo_name, path="", base_path=""):
-    """Fetch and download files from a GitHub repository."""
-    print(f"Fetching files from GitHub repository: {repo_owner}/{repo_name}, Path: {path}")
-    api_url = f"{BASE_API_URL}/{repo_owner}/{repo_name}/contents/{path}"
-    github_token = get_github_token()
-    
-    headers = {"Authorization": f"token {github_token}"}
-    check_rate_limit()  # Check and handle rate limits before making the API call
 
-    response = requests.get(api_url, headers=headers)
-    if response.status_code == 200:
-        contents = response.json()
-        for item in contents:
-            if item['type'] == 'file' and item['name'].endswith('.c'):
-                download_file(item['download_url'], base_path, item['path'])
-            elif item['type'] == 'dir':
-                new_path = os.path.join(base_path, item['name'])
-                get_files_from_github(repo_owner, repo_name, path=item['path'], base_path=new_path)
-    elif response.status_code == 403:
-        print("Rate limit exceeded. Pausing and retrying...")
-        check_rate_limit()  # Handle rate limit and retry
-        get_files_from_github(repo_owner, repo_name, path, base_path)
+def get_default_branch(session: requests.Session, owner: str, repo: str):
+    url = f"{BASE_API_URL}/{owner}/{repo}"
+    resp = session.get(url, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code == 200:
+        data = resp.json()
+        return data.get('default_branch')
     else:
-        print(f"Error accessing {api_url}. Status code: {response.status_code}")
+        LOGGER.debug('Could not get repo info %s/%s: %s', owner, repo, resp.status_code)
+        return None
 
-def download_file(file_url, base_path, original_path):
-    """Download a single file from a GitHub repository."""
-    local_file_path = os.path.join(base_path, os.path.basename(original_path))
-    os.makedirs(base_path, exist_ok=True)
 
-    if os.path.exists(local_file_path):
-        print(f"File {local_file_path} already exists. Skipping download.")
+def try_get_repo_tree(session: requests.Session, owner: str, repo: str, branch: str):
+    # Use git trees recursive which can return the whole tree in one call
+    url = f"{BASE_API_URL}/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    resp = session.get(url, timeout=DEFAULT_TIMEOUT)
+    if resp.status_code == 200:
+        data = resp.json()
+        if 'tree' in data:
+            return data['tree']
+    else:
+        LOGGER.debug('git/trees failed for %s/%s (branch=%s): %s', owner, repo, branch, resp.status_code)
+    return None
+
+
+def download_blob(session: requests.Session, owner: str, repo: str, branch: str, path: str, dest_root: str):
+    raw_url = f"{RAW_BASE}/{owner}/{repo}/{branch}/{path}"
+    local_path = os.path.join(dest_root, path)
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    if os.path.exists(local_path):
+        LOGGER.debug('File exists, skipping: %s', local_path)
         return
-
     try:
-        response = requests.get(file_url)
-        check_rate_limit()  # Check rate limits before downloading
-        if response.status_code == 200:
-            with open(local_file_path, 'w') as f:
-                f.write(response.text)
-            print(f"File downloaded: {local_file_path}")
+        r = session.get(raw_url, timeout=DEFAULT_TIMEOUT)
+        if r.status_code == 200:
+            with open(local_path, 'wb') as f:
+                f.write(r.content)
+            LOGGER.info('Downloaded %s', local_path)
         else:
-            print(f"Error downloading file: {file_url}. Status code: {response.status_code}")
-    except Exception as e:
-        print(f"Error downloading file: {file_url}: {e}")
+            LOGGER.warning('Failed to download %s: status %s', raw_url, r.status_code)
+    except requests.RequestException as e:
+        LOGGER.warning('Request failed for %s: %s', raw_url, e)
 
-def download_repositories():
-    """Download all repositories listed in the text file."""
-    errors = []  # Track errors to include in email notifications
-    with open(REPOSITORIES, "r") as file:
-        repos = file.readlines()
 
-    for repo_link in repos:
-        repo_link = repo_link.strip()
+def get_files_via_contents_api(session: requests.Session, owner: str, repo: str, base_path: str, repo_dir: str):
+    # Iterative traversal using /contents endpoint
+    stack = ['']
+    while stack:
+        path = stack.pop()
+        api_url = f"{BASE_API_URL}/{owner}/{repo}/contents/{path}" if path else f"{BASE_API_URL}/{owner}/{repo}/contents"
         try:
-            repo_owner, repo_name = extract_repo_info(repo_link)
-
-            # Create a directory for the repository
-            repo_directory = os.path.join(CLONED_PROJECTS_DIR, repo_name)
-            if os.path.exists(repo_directory):
-                print(f"The repository {repo_name} already exists in {repo_directory}. Skipping cloning.")
+            resp = session.get(api_url, timeout=DEFAULT_TIMEOUT)
+            remaining, reset = parse_rate_limit_headers(resp.headers)
+            if resp.status_code == 403 and reset:
+                wait_for_rate_limit(reset)
+                stack.append(path)
                 continue
+            if resp.status_code != 200:
+                LOGGER.warning('Non-200 listing %s: %s', api_url, resp.status_code)
+                continue
+            contents = resp.json()
+            for item in contents:
+                if item.get('type') == 'file' and item.get('name', '').endswith('.c'):
+                    # download via raw URL
+                    download_blob(session, owner, repo, base_path, item['path'], repo_dir)
+                elif item.get('type') == 'dir':
+                    stack.append(item['path'])
+        except requests.RequestException as e:
+            LOGGER.warning('Error accessing %s: %s', api_url, e)
 
-            print(f"Creating directory for repository {repo_name} at {repo_directory}")
-            os.makedirs(repo_directory, exist_ok=True)
 
-            # Fetch repository files
-            get_files_from_github(repo_owner, repo_name, base_path=repo_directory)
-        except ValueError as ve:
-            errors.append(f"Error: {ve}")
-            print(f"Error: {ve}")
-        except Exception as e:
-            errors.append(f"Unexpected error: {e}")
-            print(f"Unexpected error: {e}")
+def process_repository(session: requests.Session, repo_link: str, dest_root: str):
+    owner, name = extract_repo_info(repo_link)
+    repo_dir = os.path.join(dest_root, name)
+    if os.path.exists(repo_dir):
+        LOGGER.info('Repository exists, skipping: %s', repo_dir)
+        return
+    os.makedirs(repo_dir, exist_ok=True)
 
-    # Send email notification
-    if errors:
-        send_email("Repository Cloning Errors", "\n".join(errors))
+    # Try tree-based approach first (more efficient)
+    branch = get_default_branch(session, owner, name) or 'master'
+    tree = try_get_repo_tree(session, owner, name, branch)
+    if tree is not None:
+        LOGGER.info('Using git/trees for %s/%s', owner, name)
+        for entry in tree:
+            if entry.get('type') == 'blob' and entry.get('path', '').endswith('.c'):
+                download_blob(session, owner, name, branch, entry['path'], repo_dir)
     else:
-        send_email("Repository Cloning Completed", "All repositories were successfully cloned.")
+        LOGGER.info('Falling back to contents API for %s/%s', owner, name)
+        get_files_via_contents_api(session, owner, name, branch, repo_dir)
 
-# if __name__ == "__main__":
-#     download_repositories()
+
+def download_repositories(limit: int = None):
+    token = get_github_token()
+    session = create_session(token)
+
+    with open(REPOSITORIES, 'r') as f:
+        repos = [r.strip() for r in f if r.strip()]
+
+    if limit:
+        repos = repos[:limit]
+
+    LOGGER.info('Starting download for %d repositories (workers=%d)', len(repos), REPO_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=REPO_CONCURRENCY) as executor:
+        futures = {executor.submit(process_repository, session, link, CLONED_PROJECTS_DIR): link for link in repos}
+        for fut in as_completed(futures):
+            link = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                LOGGER.error('Processing failed for %s: %s', link, e)
+
+
+# Backwards-compat wrapper used by main.py
+def download_repositories_entry():
+    limit = None
+    env_limit = os.getenv('DOWNLOAD_LIMIT')
+    if env_limit:
+        try:
+            limit = int(env_limit)
+        except Exception:
+            LOGGER.warning('Invalid DOWNLOAD_LIMIT value: %s', env_limit)
+    download_repositories(limit=limit)
+
+
+# if __name__ == '__main__':
+#     download_repositories_entry()

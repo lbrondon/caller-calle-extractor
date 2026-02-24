@@ -55,3 +55,11 @@ source/__pypackages__/
 source/workspace/
 output/function_call_graph.csv
 output/function_call_graph (copy).csv
+
+
+# Security: GitHub token file (contains sensitive credentials)
+github_token.txt
+source/github_token.txt
+
+# Generated outputs
+output/
